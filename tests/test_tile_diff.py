@@ -331,6 +331,64 @@ def test_property_only_change_is_reported(client):
     assert [(t["x"], t["y"]) for t in changed] and len(changed) >= 1
 
 
+def test_negative_zero_float_property_change_is_reported(client):
+    # Regression: a float property flipping -0.0 -> 0.0 changes the encoded
+    # protobuf double bytes, so the manifest must list the tile even though
+    # ID, geometry and every other property are unchanged.  The unchanged
+    # globe-spanning polygon must not inflate the z=14 candidate set.
+    lng, lat = 116.4074, 39.9042
+    rev1 = [world_polygon(), point(lng, lat, {"name": "s", "offset": -0.0}, fid=1)]
+    rev2 = [world_polygon(), point(lng, lat, {"name": "s", "offset": 0.0}, fid=1)]
+    ds = _publish_one(client, rev1)
+    _publish_next(client, ds, rev2, 1)
+
+    resp = _diff(client, ds, 1, 2, 14)
+    assert resp.status_code == 200
+    tiles = resp.json()["changed_tiles"]
+    # Only the point's own z=14 tile changes; the world polygon cancels.
+    assert [(t["x"], t["y"]) for t in tiles] == [(13489, 6208)]
+    assert tiles[0]["z"] == 14
+    assert tiles[0]["from_etag"] != tiles[0]["to_etag"]
+
+    # The manifest ETags are exactly those of the pinned tile endpoint.
+    a = client.get(f"/datasets/{ds}/tiles/14/13489/6208.mvt?revision=1")
+    b = client.get(f"/datasets/{ds}/tiles/14/13489/6208.mvt?revision=2")
+    assert tiles[0]["from_etag"] == a.headers["etag"]
+    assert tiles[0]["to_etag"] == b.headers["etag"]
+    assert a.content != b.content
+
+    # Agreement with an exhaustive compile of the whole z=3 grid.
+    expected = _brute_force_changed_tiles(client, ds, 1, 2, 3)
+    got = {(t["x"], t["y"]) for t in _diff(client, ds, 1, 2, 3).json()["changed_tiles"]}
+    assert got == expected and expected
+
+    # A far-away tile (world polygon only) is byte-identical across revisions.
+    far1 = client.get(f"/datasets/{ds}/tiles/14/0/0.mvt?revision=1")
+    far2 = client.get(f"/datasets/{ds}/tiles/14/0/0.mvt?revision=2")
+    assert far1.content == far2.content
+    assert far1.headers["etag"] == far2.headers["etag"]
+
+
+def test_unchanged_negative_zero_property_compiles_to_empty_diff(client):
+    # Safe cancellation: identical float properties (including -0.0) in both
+    # revisions produce no candidates and an empty manifest.
+    rev1 = [world_polygon(), point(116.4074, 39.9042, {"offset": -0.0}, fid=1)]
+    rev2 = [world_polygon(), point(116.4074, 39.9042, {"offset": -0.0}, fid=1)]
+    ds = _publish_one(client, rev1)
+    _publish_next(client, ds, rev2, 1)
+    assert _diff(client, ds, 1, 2, 14).json()["changed_tiles"] == []
+
+
+def test_geometry_negative_zero_quantises_to_empty_diff(client):
+    # A coordinate sign flip -0.0 -> 0.0 quantises to the same integer grid
+    # point, so no tile bytes change and the manifest stays empty.
+    rev1 = [point(-0.0, 0.0, {"k": "v"}, fid=1)]
+    rev2 = [point(0.0, 0.0, {"k": "v"}, fid=1)]
+    ds = _publish_one(client, rev1)
+    _publish_next(client, ds, rev2, 1)
+    assert _diff(client, ds, 1, 2, 5).json()["changed_tiles"] == []
+
+
 def test_features_without_or_with_duplicate_ids_are_not_missed(client):
     # Two ID-less points and two points sharing id 7; move one of each group.
     rev1 = [
@@ -648,6 +706,51 @@ def test_correspondence_bool_vs_int_property_is_a_change():
     b = _as_shapely_features([point(10.0, 10.0, {"open": 1}, fid=1)])
     changed_a, changed_b = tilediff.changed_features(a, b)
     assert len(changed_a) == 1 and len(changed_b) == 1
+
+
+def test_correspondence_negative_zero_float_property_is_a_change():
+    # -0.0 == 0.0 in Python, but protobuf encodes them as different doubles
+    # (0x8000... vs 0x0000...): the pair must NOT cancel.
+    a = _as_shapely_features([point(10.0, 10.0, {"offset": -0.0}, fid=1)])
+    b = _as_shapely_features([point(10.0, 10.0, {"offset": 0.0}, fid=1)])
+    changed_a, changed_b = tilediff.changed_features(a, b)
+    assert len(changed_a) == 1 and len(changed_b) == 1
+
+
+def test_correspondence_int_zero_vs_negative_zero_float_is_a_change():
+    # int 0 and float -0.0 are different MVT value types (int64 vs double):
+    # never equal, even though 0 == -0.0 numerically.
+    a = _as_shapely_features([point(10.0, 10.0, {"v": 0}, fid=1)])
+    b = _as_shapely_features([point(10.0, 10.0, {"v": -0.0}, fid=1)])
+    changed_a, changed_b = tilediff.changed_features(a, b)
+    assert len(changed_a) == 1 and len(changed_b) == 1
+
+
+def test_correspondence_identical_float_properties_cancel():
+    # Bit-identical floats encode to the same double bytes and must still
+    # cancel: ordinary values, -0.0 vs -0.0, and NaN vs NaN (numerically
+    # unequal, but the encoder writes the identical NaN payload).
+    feats = _as_shapely_features(
+        [point(10.0, 10.0,
+               {"neg": -0.0, "pos": 0.0, "v": 1.5, "nan": float("nan")},
+               fid=1)]
+    )
+    changed_a, changed_b = tilediff.changed_features(feats, feats)
+    assert changed_a == [] and changed_b == []
+
+
+def test_identical_float_properties_produce_no_candidates():
+    # Unchanged float properties must not be blanket-sent to candidates:
+    # a globe-spanning polygon carrying float attributes, identical in both
+    # revisions, enumerates nothing even at z=14 (a full-grid walk would be
+    # 2**28 tiles).
+    feats = _as_shapely_features(
+        [world_polygon(props={"level": -0.0, "ratio": 0.0}),
+         point(116.4074, 39.9042, {"offset": -0.0}, fid=1)]
+    )
+    assert tilediff.candidate_tiles(feats, feats, 14) == []
+    changed_a, changed_b = tilediff.changed_features(feats, feats)
+    assert changed_a == [] and changed_b == []
 
 
 def test_correspondence_add_delete_and_move():

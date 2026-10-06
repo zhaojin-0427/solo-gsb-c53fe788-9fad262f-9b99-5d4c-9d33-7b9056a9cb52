@@ -33,7 +33,10 @@ Cross-revision correspondence has to match the encoder exactly, because
   such features changes the encoded bytes and must never be falsely
   cancelled;
 * a pair is "the same feature" only when geometry and typed properties are
-  equal (``1`` and ``true`` encode differently and never compare equal);
+  equal (``1`` and ``true`` encode differently and never compare equal;
+  floats compare by their IEEE-754 bit pattern -- exactly what the
+  protobuf ``double`` encoder writes -- so ``-0.0`` and ``0.0`` count as a
+  change while ``NaN`` payloads still cancel);
 * group size differences (added / deleted features) leave the surplus
   features unmatched.
 
@@ -49,6 +52,7 @@ of neighbouring tiles -- never the whole ``2**14`` grid (which would be
 from __future__ import annotations
 
 import math
+import struct
 from itertools import groupby
 from typing import Iterable
 
@@ -129,14 +133,21 @@ def _property_values_equal(a: object, b: object) -> bool:
 
     ``bool`` is an ``int`` subclass but protobuf encodes ``true`` and ``1``
     with different value types, so equal numeric value across the two types
-    must not count as identical.  Every other pair has to share its exact
-    type (string / int / float) and value; mismatches are "changed" (which
-    only adds candidates, it never removes them).
+    must not count as identical.  Floats are compared by their IEEE-754 bit
+    pattern -- the very bytes the protobuf ``double`` encoder emits:
+    ``-0.0`` and ``0.0`` compare equal numerically yet encode to different
+    bytes, so they must *not* cancel, while ``NaN`` payloads compare
+    unequal numerically but encode identically, so they still cancel.
+    Every other pair has to share its exact type (string / int) and value;
+    mismatches are "changed" (which only adds candidates, it never removes
+    them).
     """
     if isinstance(a, bool) or isinstance(b, bool):
         return isinstance(a, bool) and isinstance(b, bool) and a == b
     if type(a) is not type(b):
         return False
+    if isinstance(a, float):
+        return struct.pack(">d", a) == struct.pack(">d", b)
     return bool(a == b)
 
 
@@ -145,7 +156,10 @@ def _features_equal(feature_a: dict, feature_b: dict) -> bool:
 
     Only an exact match of (typed) properties and geometry counts; a
     mismatch anywhere leaves both features unmatched so their buffered tile
-    ranges enter the candidate set.
+    ranges enter the candidate set.  Float properties compare by IEEE-754
+    bit pattern (see :func:`_property_values_equal`), so a ``-0.0`` ->
+    ``0.0`` flip -- invisible to ``==`` but a different protobuf ``double``
+    encoding -- is a real change.
     """
     props_a = feature_a.get("properties") or {}
     props_b = feature_b.get("properties") or {}
