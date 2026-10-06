@@ -16,7 +16,7 @@
 | 乐观并发控制 | 发布新版本必须携带 `expected_revision`，与当前 head 不一致时返回 **409 Conflict**；head 比较、revision 插入与 head 更新在单个跨进程有效的 `BEGIN IMMEDIATE` 事务内原子完成，多 worker 并发追加也只有一方成功 |
 | 瓦片编译 | `GET /datasets/{id}/tiles/{z}/{x}/{y}.mvt`，支持 **z = 0–14** 的 XYZ 瓦片 |
 | 点选（identify） | `GET /datasets/{id}/tiles/{z}/{x}/{y}/identify?px=&py=&radius_px=[&revision=]`，在瓦片内点击处（源像素 `0≤px,py<256`、半径 `0–8 px`）按**编译后可见几何**裁决命中：面内距离为 0，线 / 点须落在圆形半径内；逐源要素编译，**保留 0 基源序号**与 4096 网格上的**亚像素点击位置**，无 ID / 字符串 ID / 重复 ID 不合并、量化后消失的几何不命中、缓冲边缘按同半径裁决，结果按距离再按源序号排序（见 [§4.9](#49-点选identify)） |
-| 离线增量清单 | `GET /datasets/{id}/tile-diff?from_revision=&to_revision=&z=`，按 **x、y 升序**返回两个修订间**实际 MVT 字节发生变化**的瓦片坐标及两端 ETag（ETag 与钉版瓦片逐字节一致）；候选范围**只由两版中没有完全相同对应的要素**（新增 / 删除 / 移动 / 属性变化 / 同排序键换序）的几何外扩 **8 px 缓冲**求并集得到——跨版对应按**编码器自己的排序键 + 键内源顺序**配对（无 ID 按内容哈希、重复 ID 不合并、同排序键换序不误抵消）；因此两版都保留覆盖全球的面、只移动一个局部点时，**z=14 只枚举该点旧、新位置的 8 px 邻瓦片，绝不遍历 2³⁴ 个全球瓦片**；源文档不同但瓦片编码相同不报 |
+| 离线增量清单 | `GET /datasets/{id}/tile-diff?from_revision=&to_revision=&z=`，按 **x、y 升序**返回两个修订间**实际 MVT 字节发生变化**的瓦片坐标及两端 ETag（ETag 与钉版瓦片逐字节一致）；候选范围**只由两版中没有完全相同对应的要素**（新增 / 删除 / 移动 / 属性变化 / 同排序键换序）的几何外扩 **8 px 缓冲**求并集得到——跨版对应按**编码器自己的排序键 + 键内源顺序**配对（无 ID 按内容哈希、重复 ID 不合并、同排序键换序不误抵消）；浮点属性按编码器原样写入的 **IEEE-754 double 比特**判同，`-0.0 → 0.0` 这类 Python `==` 判等、但 MVT 符号位不同的改动**必被检出**，比特相同的浮点仍安全抵消、不产生候选；因此两版都保留覆盖全球的面、只改一个局部点时，**z=14 只枚举该点所在的 8 px 邻瓦片，绝不遍历 2³⁴ 个全球瓦片**；源文档不同但瓦片编码相同不报（`-0.0→0.0` 端到端复核见 [§4.10](#410-浮点符号位漏报复核--00--00)） |
 | 投影 | EPSG:4326 经纬度 → 球面 Web Mercator（R = 6378137），瓦片内坐标系为 4096 网格、Y 轴向下 |
 | 8 像素缓冲裁剪 | 点 / 线 / 面先裁剪到瓦片外扩 **8 px（128/4096 单位）**的边界，保证跨瓦片连续 |
 | 0.5 px 拓扑简化 | 以 **0.5 px（8/4096 单位）**容差做保拓扑 Douglas–Peucker 简化 |
@@ -47,12 +47,14 @@
 │   ├── sample.geojson          # 示例图层（点 / 线 / 面）
 │   ├── local-update-v1.geojson # 增量清单复核 revision 1：覆盖全球的面 + 北京一个点（见 §4.6）
 │   ├── local-update-v2.geojson # 增量清单复核 revision 2：面不变，点微移 30 m 且属性改值（见 §4.6）
+│   ├── signed-zero-v1.geojson  # 浮点符号位漏报复核 revision 1：全球面 + 点属性 score=-0.0（见 §4.10）
+│   ├── signed-zero-v2.geojson  # 复核 revision 2：面与几何不动，仅把 score 改为 0.0（见 §4.10）
 │   ├── tiny-polygon.geojson    # 退化小多边形复核 revision 1（含 ~0.1 mm 小三角，见 §4.8）
 │   ├── tiny-polygon-v2.geojson # 复核 revision 2：删除小三角、点属性改名
 │   └── tiny-polygon-v3.geojson # 复核 revision 3：仅把小三角加回（瓦片与 v2 逐字节相同）
 ├── scripts/
 │   └── hold_init_lock.py # 持锁复核辅助：独占 <db>.init.lock（可定时释放）
-├── tests/               # pytest 测试（145 个用例，含点选裁决、瓦片增量清单与全球面+局部点回归、量化坍缩环裁决、非阻塞建库锁、初始化竞态与跨进程追加发布竞态回归）
+├── tests/               # pytest 测试（152 个用例，含点选裁决、瓦片增量清单与全球面+局部点回归、-0.0→0.0 浮点符号位漏报回归、量化坍缩环裁决、非阻塞建库锁、初始化竞态与跨进程追加发布竞态回归）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt
@@ -76,9 +78,11 @@ docker compose up -d --build
   （用法与真实请求 / 响应示例见 [§4.9](#49-点选identify)）
 - 离线增量清单 API（发布两版数据后即可调用）：
   `GET http://localhost:8000/datasets/{id}/tile-diff?from_revision=1&to_revision=2&z=14`
-  ——两版都保留覆盖全球的面、只移动一个局部点时，也只枚举点附近的少量邻瓦片；
+  ——两版都保留覆盖全球的面、只移动一个局部点或只改一个局部浮点属性（如
+  `-0.0 → 0.0`）时，也只枚举点附近的少量邻瓦片；
   完整的“发布 revision 1/2 → 拉取局部更新清单 → 与钉版 ETag 核对”实际请求 /
-  响应示例见 [§4.6](#46-离线瓦片增量清单tile-diff)
+  响应示例见 [§4.6](#46-离线瓦片增量清单tile-diff)，浮点符号位 `-0.0→0.0` 的
+  漏报修复端到端复核见 [§4.10](#410-浮点符号位漏报复核--00--00)
 - SQLite 数据库保存在 Docker 命名卷 `tile-data`（容器内 `/data/tiles.db`），容器重建后数据不丢
 - 默认以 **2 个 uvicorn worker 进程**启动（`VT_WORKERS=2`），两个进程共享同一个
   SQLite 文件；**首次启动建库由跨进程文件锁串行化、并带有界重试**（见
@@ -628,8 +632,11 @@ curl -i -H 'If-None-Match: "75dd0d37d05a70e4ed743cb72731f3bb8f3d0a513cfa58a1b473
      相同排序键保持稳定排序）对位配对**——组内换序会改变 MVT 字节，因此**绝不**被当作
      “无变化”而误抵消；
    - 一对要素只有在**几何顶点完全相同且属性按编码类型逐项相同**时才算同一要素
-     （JSON 的 `true` 与整数 `1`、`1` 与 `1.0` 在 MVT 中是不同的值类型，不判同；属性
-     键在源文档中的书写顺序不影响判断）；
+     （JSON 的 `true` 与整数 `1`、整数 `1` 与浮点 `1.0` 在 MVT 中是不同的值类型，
+     不判同；两个浮点则按编码器原样写入 protobuf 的 **IEEE-754 double 比特**判同：
+     `-0.0` 与 `0.0` 数值相等却有符号位差异、编码字节不同，**不判同**，比特完全相同
+     的浮点才安全抵消；属性键在源文档中的书写顺序不影响判断，端到端复核见
+     [§4.10](#410-浮点符号位漏报复核--00--00)）；
    - 组长度不同（新增 / 删除）时，多出来的要素全部落单。
 2. **候选集（只增不漏，且只覆盖可能变动的区域）**：对配对中**落单 / 不相等的要素**，
    用与瓦片管线完全相同的 Web Mercator 投影（含 ±85.05112878° 纬度截断）求 mercator
@@ -1235,6 +1242,221 @@ curl -s -i "http://localhost:8000/datasets/$DS/tiles/0/0/0/identify?px=1&py=1&ra
 > **不读取也不写入** SQLite `tile_cache`，因此既有的
 > `GET …/{z}/{x}/{y}.mvt` 瓦片字节与 ETag 完全不变。
 
+### 4.10 浮点符号位漏报复核（`-0.0` → `0.0`）
+
+本节复核一个只发生在**浮点属性**上的真实漏报：要素 ID 与几何完全相同，属性仅由
+`-0.0` 改为 `0.0`。这两个值满足 Python `-0.0 == 0.0`，但 MVT 编码器把 Python
+浮点**原样**写入 protobuf `double_value`，两者的 IEEE-754 符号位不同
+（`0x8000000000000000` vs `0x0000000000000000`），所以瓦片字节确实不同。旧的跨版
+对应直接用数值相等判属性，会把**唯一变动的要素**误判为“未变化”而抵消：候选集为空，
+明明两版瓦片字节不同却返回空清单。
+
+修复方法不是“把所有浮点要素都送进候选集”——那会让两版都保留覆盖全球面的 z=14 局部
+更新退化成遍历 2.68 亿块；而是把浮点比较依据换成**编码器实际写出的 double 比特**：
+比特不同（如 `-0.0 → 0.0`、NaN 载荷变化）才算变动并枚举其局部邻瓦片，比特相同的浮点
+要素仍安全抵消、零候选。布尔 / 整数的值类型边界、无 ID、重复 ID、同键换序的既有规则
+都不受影响。
+
+复核数据用仓库自带的 `data/signed-zero-v1.geojson` 与 `data/signed-zero-v2.geojson`：
+两版都含**同一个覆盖全球的面**（id=1）和北京附近同一个点（id=2，几何坐标逐字节相同），
+唯一差别是点的属性 `score` 由 `-0.0` 变成 `0.0`。
+
+**第 1 步：发布 revision 1**
+
+```bash
+curl -s -X POST http://localhost:8000/datasets \
+  -F "file=@data/signed-zero-v1.geojson;type=application/geo+json" \
+  -F "layer=demo"
+```
+
+```json
+{
+    "id": "314fa5dd14e44bf88a623ef8307ecc1f",
+    "layer": "demo",
+    "revision": 1,
+    "content_hash": "8050d5a21a5190e00e185ea6203eddbcb0fd12c86a2f5cd047b32e8c06e629b7",
+    "feature_count": 2,
+    "published_at": "2026-10-06T03:47:08Z"
+}
+```
+
+```bash
+DS=314fa5dd14e44bf88a623ef8307ecc1f   # 换成你实际拿到的 id
+```
+
+**第 2 步：发布 revision 2（只改符号位，几何不动）**
+
+```bash
+curl -s -X POST "http://localhost:8000/datasets/$DS/revisions" \
+  -F "file=@data/signed-zero-v2.geojson;type=application/geo+json" \
+  -F "expected_revision=1"
+```
+
+```json
+{
+    "id": "314fa5dd14e44bf88a623ef8307ecc1f",
+    "layer": "demo",
+    "revision": 2,
+    "content_hash": "3774faf47b9ffef058eef1c96852b8913bada3cd6f89de1dcdfe7f7f5e366096",
+    "feature_count": 2,
+    "published_at": "2026-10-06T03:47:08Z"
+}
+```
+
+两个 `content_hash` 不同（规范化 JSON 中 `-0.0` 与 `0.0` 文本就不同），但关键不在源
+文档而在编码字节。
+
+**第 3 步：请求 z=14 增量清单——修复前为空，修复后如实列出点所在的 1 块**
+
+```bash
+curl -s -i "http://localhost:8000/datasets/$DS/tile-diff?from_revision=1&to_revision=2&z=14"
+```
+
+```http
+HTTP/1.1 200 OK
+content-type: application/json
+```
+
+```json
+{
+    "dataset_id": "314fa5dd14e44bf88a623ef8307ecc1f",
+    "z": 14,
+    "from_revision": 1,
+    "to_revision": 2,
+    "changed_tiles": [
+        {
+            "z": 14,
+            "x": 13489,
+            "y": 6208,
+            "from_etag": "\"34b88f612e7b191588610451c09fc8606d9592e2e756d21d06340f1c50ccdc4b\"",
+            "to_etag": "\"86688580bb0e704e4448a0d3168dd8d06a04bd8e703209929a4996dec3a32910\""
+        }
+    ]
+}
+```
+
+要点：
+
+- 候选**只**来自被比特比较判为变动的那个点，枚举范围是它所在的局部瓦片；覆盖全球的
+  面在两版中完全相同、**零候选**，因此不会退化为全域扫描。
+- 清单按 x/y 升序（本例仅 1 块）；两端 ETag 不同，与钉版瓦片接口逐字符一致。
+
+**第 4 步：用钉版瓦片接口核对 ETag，并直接查看字节差异**
+
+```bash
+curl -s -D - -o /tmp/sz-r1.mvt \
+  "http://localhost:8000/datasets/$DS/tiles/14/13489/6208.mvt?revision=1"
+curl -s -D - -o /tmp/sz-r2.mvt \
+  "http://localhost:8000/datasets/$DS/tiles/14/13489/6208.mvt?revision=2"
+```
+
+```http
+HTTP/1.1 200 OK
+etag: "34b88f612e7b191588610451c09fc8606d9592e2e756d21d06340f1c50ccdc4b"
+x-revision: 1
+content-length: 114
+cache-control: public, max-age=31536000, immutable
+content-type: application/vnd.mapbox-vector-tile
+```
+
+```http
+HTTP/1.1 200 OK
+etag: "86688580bb0e704e4448a0d3168dd8d06a04bd8e703209929a4996dec3a32910"
+x-revision: 2
+content-length: 114
+cache-control: public, max-age=31536000, immutable
+content-type: application/vnd.mapbox-vector-tile
+```
+
+两版瓦片都为 114 字节，且**恰好只有 1 个字节不同**——`score` 那个 double 的符号位
+（偏移 108：`0x80` → `0x00`）。在容器内解码 / 比对：
+
+```bash
+docker compose exec -T vector-tiles sh -c '
+python - <<EOF
+import hashlib, mapbox_vector_tile, urllib.request
+def tile(rev):
+    return urllib.request.urlopen(
+        "http://127.0.0.1:8000/datasets/$DS/tiles/14/13489/6208.mvt?revision=%d" % rev
+    ).read()
+a, b = tile(1), tile(2)
+print("bytes equal:", a == b)
+print("differing offset(s):", [i for i in range(len(a)) if a[i] != b[i]], "(0x80 -> 0x00)")
+for body in (a, b):
+    layer = mapbox_vector_tile.decode(body, default_options={"y_coord_down": True})["demo"]
+    print([f["properties"] for f in layer["features"]])
+EOF'
+```
+
+```text
+bytes equal: False
+differing offset(s): [108] (0x80 -> 0x00)
+[{'name': 'World coverage'}, {'name': 'Sensor A', 'score': -0.0}]
+[{'name': 'World coverage'}, {'name': 'Sensor A', 'score': 0.0}]
+```
+
+**第 5 步：远离北京的全球瓦片两版逐字节相同，不在清单中**
+
+```bash
+for r in 1 2; do
+  curl -s "http://localhost:8000/datasets/$DS/tiles/14/0/0.mvt?revision=$r" | sha256sum
+done
+# 2a792afe41c934edd71c07b2b290f8a698c16656b5251f22be4e7a10d7e2fa06  -
+# 2a792afe41c934edd71c07b2b290f8a698c16656b5251f22be4e7a10d7e2fa06  -
+```
+
+`14/0/0` 只有 13 字节、仅含未变化的全球面，两版哈希相同，因此正确地**不**出现在清单
+里——这也证明浮点比较修复没有把未变要素推进候选集。
+
+**低缩放级别同样检出**（点与全球面同在该瓦片中，且只有这一块变化）：
+
+```bash
+curl -s "http://localhost:8000/datasets/$DS/tile-diff?from_revision=1&to_revision=2&z=0"
+```
+
+```json
+{
+    "dataset_id": "314fa5dd14e44bf88a623ef8307ecc1f",
+    "z": 0,
+    "from_revision": 1,
+    "to_revision": 2,
+    "changed_tiles": [
+        {
+            "z": 0,
+            "x": 0,
+            "y": 0,
+            "from_etag": "\"4b93c65b71725c3782ea9d6c4d85329838351de299ac1e1c064128e7cca91519\"",
+            "to_etag": "\"61b726311e28f003a31efd59badd3ddb969b135f99663930c4adc58e44a7dbf7\""
+        }
+    ]
+}
+```
+
+**反向发布（`0.0` 改回 `-0.0`）同样检出**，且 ETag 方向互换；**相同修订仍为空清单**
+（不枚举任何瓦片）：
+
+```bash
+curl -s -X POST "http://localhost:8000/datasets/$DS/revisions" \
+  -F "file=@data/signed-zero-v1.geojson;type=application/geo+json" \
+  -F "expected_revision=2"
+# revision 3 ...
+
+curl -s "http://localhost:8000/datasets/$DS/tile-diff?from_revision=2&to_revision=3&z=14"
+# {"dataset_id":"...","z":14,"from_revision":2,"to_revision":3,"changed_tiles":[
+#   {"z":14,"x":13489,"y":6208,
+#    "from_etag":"\"86688580bb0e704e4448a0d3168dd8d06a04bd8e703209929a4996dec3a32910\"",
+#    "to_etag":"\"34b88f612e7b191588610451c09fc8606d9592e2e756d21d06340f1c50ccdc4b\""}]}
+
+curl -s "http://localhost:8000/datasets/$DS/tile-diff?from_revision=2&to_revision=2&z=14"
+# {"dataset_id":"...","z":14,"from_revision":2,"to_revision":2,"changed_tiles":[]}
+```
+
+> **比较依据总结**：属性判同只用于“能否安全抵消未变要素”，候选瓦片最终仍以**编码字节**
+> 裁决。浮点按 IEEE-754 double 比特比较，恰好与编码器逐字节一致——既能区分
+> `-0.0/0.0` 这种编码差异，又不会把任何编码完全相同的浮点要素送入候选，因此 z=14 局部
+> 更新始终是局部枚举。无 ID（按内容哈希配对）、重复 ID（组内对位）、同键换序（不抵消）
+> 以及布尔 / 整数的不同值类型（`true` ≠ `1` ≠ `1.0`）规则均保持不变。
+
 ---
 
 ## 5. 瓦片规格（编译管线）
@@ -1266,8 +1488,11 @@ ETag 会持久化在 SQLite `tile_cache` 表中，因此重复请求乃至服务
 > 瓦片。tile-diff 先把两版要素按编码器的排序键 + 键内源顺序配对（无 ID 按内容哈希、
 > 重复 ID 不合并、同排序键换序不抵消），只对没有完全相同对应的要素，把其 Web Mercator
 > 包围盒外扩 128/4096 个瓦片跨度（8 px）映射为瓦片索引、取并集；因此两版相同的全球面
-> 不产生任何候选，而移动点的旧、新位置及缓冲邻瓦片都在集合内。随后每个候选仍走上面的
-> 完整管线并按编码字节裁决（见 [§4.6](#46-离线瓦片增量清单tile-diff)）。
+> 不产生任何候选，而移动点的旧、新位置及缓冲邻瓦片都在集合内。浮点属性按编码器写入的
+> IEEE-754 double 比特判同，`-0.0 → 0.0`（数值相等、符号位不同）的要素不会被误抵消，
+> 比特相同的浮点仍安全抵消、不扩大枚举。随后每个候选仍走上面的完整管线并按编码字节
+> 裁决（见 [§4.6](#46-离线瓦片增量清单tile-diff) 与
+> [§4.10](#410-浮点符号位漏报复核--00--00)）。
 
 > 说明：MVT 要素 ID 按协议仅支持非负 uint64 整数；字符串 ID 的要素仍会被
 > 确定性排序，但其 ID 不写入 protobuf（属性中若需要可自行保留）。

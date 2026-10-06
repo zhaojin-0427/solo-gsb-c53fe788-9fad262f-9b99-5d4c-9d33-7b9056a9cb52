@@ -622,7 +622,12 @@ def get_tile_diff(dataset_id: str, request: Request) -> JSONResponse:
     the encoder's own sort key -- content hash for ID-less features, so no-ID
     and duplicate-ID features never collapse -- and pairs equal-key features
     positionally, so a reorder of same-key features (which changes MVT bytes)
-    is not falsely cancelled.  Only unmatched features (additions, deletions,
+    is not falsely cancelled.  Float properties are compared by the raw
+    IEEE-754 double bits the encoder writes verbatim, so a ``-0.0`` to
+    ``0.0`` edit -- equal under Python ``==`` but different MVT bytes --
+    keeps the feature unmatched instead of silently emptying the candidate
+    set, while bit-identical floats still cancel and never add candidates.
+    Only unmatched features (additions, deletions,
     moves, property edits, identity reorders) then drive candidates: their
     mercator bounds are grown by the same 8 px buffer used when clipping, so
     a moved point's old *and* new buffer neighbours are all covered while a

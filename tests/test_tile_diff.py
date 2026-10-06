@@ -12,6 +12,7 @@ The manifest must
 * touch only a handful of tiles for a localised z=14 update.
 """
 import json
+import struct
 
 from shapely.geometry import shape
 
@@ -331,6 +332,114 @@ def test_property_only_change_is_reported(client):
     assert [(t["x"], t["y"]) for t in changed] and len(changed) >= 1
 
 
+def test_negative_zero_float_change_is_reported_at_z14(client):
+    # Regression for the false negative: same ID, same geometry, property
+    # goes from -0.0 to 0.0.  Python == cancels the pair, but the MVT
+    # double_value keeps the sign bit, so tile bytes differ and the local
+    # z=14 tile(s) must be reported -- without enumerating anything outside
+    # the feature's own buffered neighbourhood.
+    lng, lat = 116.4074, 39.9042
+    rev1 = [point(lng, lat, {"score": -0.0}, fid=1)]
+    rev2 = [point(lng, lat, {"score": 0.0}, fid=1)]
+    ds = _publish_one(client, rev1)
+    _publish_next(client, ds, rev2, 1)
+
+    # Source-level: the feature is unmatched, so candidates stay local.
+    c1 = _as_shapely_features(rev1)
+    c2 = _as_shapely_features(rev2)
+    candidates = tilediff.candidate_tiles(c1, c2, 14)
+    assert 1 <= len(candidates) <= 4
+    x = int((lng + 180) / 360 * (1 << 14))
+    assert all(abs(cx - x) <= 1 for cx, _ in candidates)
+
+    resp = _diff(client, ds, 1, 2, 14)
+    assert resp.status_code == 200
+    tiles = resp.json()["changed_tiles"]
+    assert len(tiles) == 1
+    entry = tiles[0]
+    assert entry["from_etag"] != entry["to_etag"]
+    assert [t["x"] for t in tiles] == sorted(t["x"] for t in tiles)
+
+    # The diff agrees with brute force over the (small) candidate
+    # neighbourhood -- no reported tile misses the byte check and no
+    # unreported neighbour actually changes -- and the pinned endpoint
+    # ETags match exactly.
+    from app.tiler import compile_tile
+
+    for cx, cy in candidates:
+        b1 = compile_tile({"demo": c1}, 14, cx, cy)
+        b2 = compile_tile({"demo": c2}, 14, cx, cy)
+        listed = any(t["x"] == cx and t["y"] == cy for t in tiles)
+        assert listed == (b1 != b2)
+    tx, ty = entry["x"], entry["y"]
+    e1 = client.get(f"/datasets/{ds}/tiles/14/{tx}/{ty}.mvt?revision=1").headers["etag"]
+    e2 = client.get(f"/datasets/{ds}/tiles/14/{tx}/{ty}.mvt?revision=2").headers["etag"]
+    assert entry["from_etag"] == e1 and entry["to_etag"] == e2
+
+    # The reverse publish (0.0 back to -0.0) is detected identically.
+    _publish_next(client, ds, rev1, 2)
+    back = _diff(client, ds, 2, 3, 14).json()["changed_tiles"]
+    assert {(t["x"], t["y"]): (t["from_etag"], t["to_etag"]) for t in back} == {
+        (tx, ty): (entry["to_etag"], entry["from_etag"])
+    }
+
+
+def test_negative_zero_change_with_global_polygon_stays_local(client):
+    # The exact production shape: both revisions keep a globe-spanning
+    # polygon; only a local point's property flips -0.0 -> 0.0.  The fix
+    # must (a) detect the change -- pre-fix the cancelled pair left zero
+    # candidates and an empty manifest despite different tile bytes -- and
+    # (b) keep enumeration local, since feeding every float-bearing feature
+    # to the enumerator would walk the whole z14 grid.
+    lng, lat = 116.4074, 39.9042
+    rev1 = [world_polygon(), point(lng, lat, {"score": -0.0}, fid=1)]
+    rev2 = [world_polygon(), point(lng, lat, {"score": 0.0}, fid=1)]
+    ds = _publish_one(client, rev1)
+    _publish_next(client, ds, rev2, 1)
+
+    import time
+
+    t0 = time.monotonic()
+    resp = _diff(client, ds, 1, 2, 14)
+    elapsed = time.monotonic() - t0
+    assert resp.status_code == 200
+    assert elapsed < 10.0
+
+    tiles = resp.json()["changed_tiles"]
+    assert len(tiles) == 1
+    entry = tiles[0]
+    assert entry["from_etag"] != entry["to_etag"]
+    x = int((lng + 180) / 360 * (1 << 14))
+    assert abs(entry["x"] - x) <= 1
+
+    # The unchanged globe polygon still compiles byte-identically in a
+    # far-away tile, so it is (correctly) absent from the manifest.
+    far1 = client.get("/datasets/%s/tiles/14/0/0.mvt?revision=1" % ds)
+    far2 = client.get("/datasets/%s/tiles/14/0/0.mvt?revision=2" % ds)
+    assert far1.content == far2.content
+    assert far1.headers["etag"] == far2.headers["etag"]
+
+
+def test_negative_zero_change_reported_without_and_with_ids(client):
+    # No-ID and duplicate-ID feature groups also have to surface the
+    # -0.0 -> 0.0 edit rather than matching the wrong copy.
+    rev1 = [
+        point(10.0, 10.0, {"score": -0.0}),
+        point(10.0, 11.0, {"score": -0.0}, fid=7),
+        point(10.0, 12.0, {"score": 0.0}, fid=7),
+    ]
+    rev2 = [
+        point(10.0, 10.0, {"score": 0.0}),
+        point(10.0, 11.0, {"score": 0.0}, fid=7),
+        point(10.0, 12.0, {"score": 0.0}, fid=7),
+    ]
+    ds = _publish_one(client, rev1)
+    _publish_next(client, ds, rev2, 1)
+    expected = _brute_force_changed_tiles(client, ds, 1, 2, 6)
+    got = {(t["x"], t["y"]) for t in _diff(client, ds, 1, 2, 6).json()["changed_tiles"]}
+    assert got == expected and expected
+
+
 def test_features_without_or_with_duplicate_ids_are_not_missed(client):
     # Two ID-less points and two points sharing id 7; move one of each group.
     rev1 = [
@@ -648,6 +757,71 @@ def test_correspondence_bool_vs_int_property_is_a_change():
     b = _as_shapely_features([point(10.0, 10.0, {"open": 1}, fid=1)])
     changed_a, changed_b = tilediff.changed_features(a, b)
     assert len(changed_a) == 1 and len(changed_b) == 1
+
+
+def test_property_value_float_sign_bit_is_a_change():
+    # -0.0 and 0.0 compare equal in Python but the encoder writes the raw
+    # IEEE-754 double bits into protobuf double_value, so the MVT bytes
+    # differ: they must NOT cancel.  Regression for the false-negative where
+    # the only changed feature was cancelled, leaving zero candidates while
+    # the tile bytes actually changed.
+    eq = tilediff._property_values_equal
+    assert eq(-0.0, 0.0) is False
+    assert eq(0.0, -0.0) is False
+    # Bit-identical floats still cancel (incl. the negative zero itself)...
+    assert eq(-0.0, -0.0) is True
+    assert eq(1.5, 1.5) is True
+    # ... and distinct NaN payloads encode to different bytes as well.
+    nan_a = struct.unpack("<d", struct.pack("<Q", 0x7FF8000000000000))[0]
+    nan_b = struct.unpack("<d", struct.pack("<Q", 0x7FF8000000000001))[0]
+    assert nan_a != nan_a and nan_b != nan_b  # both are NaNs
+    assert eq(nan_a, nan_b) is False
+    # bool / int / float still keep their value-type boundaries.
+    assert eq(1.0, 1) is False
+    assert eq(True, 1.0) is False
+    assert eq(1, 1.0) is False
+    assert eq(2, 2) is True and eq("x", "x") is True
+    assert eq(2, 3) is False and eq("x", "y") is False
+
+
+def test_correspondence_negative_zero_float_property_is_a_change():
+    # Same ID, vertex-identical geometry, only -0.0 -> 0.0: the pair must
+    # stay unmatched in both directions.
+    a = _as_shapely_features([point(10.0, 10.0, {"score": -0.0}, fid=1)])
+    b = _as_shapely_features([point(10.0, 10.0, {"score": 0.0}, fid=1)])
+    changed_a, changed_b = tilediff.changed_features(a, b)
+    assert len(changed_a) == 1 and len(changed_b) == 1
+    assert changed_a[0]["id"] == changed_b[0]["id"] == 1
+    # The reverse edit is equally a change.
+    changed_b2, changed_a2 = tilediff.changed_features(b, a)
+    assert len(changed_b2) == 1 and len(changed_a2) == 1
+
+
+def test_correspondence_idless_negative_zero_property_is_a_change():
+    # ID-less features group by a content hash that keeps the repr of the
+    # float (-0.0 != 0.0 textually), so a sign-bit edit lands as one old
+    # unmatched and one new unmatched feature -- never a false cancellation.
+    a = _as_shapely_features(
+        [point(10.0, 10.0, {"score": -0.0}), point(-20.0, 20.0, {"k": "b"})]
+    )
+    b = _as_shapely_features(
+        [point(10.0, 10.0, {"score": 0.0}), point(-20.0, 20.0, {"k": "b"})]
+    )
+    changed_a, changed_b = tilediff.changed_features(a, b)
+    assert len(changed_a) == 1 and len(changed_b) == 1
+
+
+def test_correspondence_identical_floats_and_key_reorder_cancel():
+    # Unchanged float values -- including negative zero itself -- and a
+    # mere property-key source-order change must still cancel safely.
+    a = _as_shapely_features(
+        [point(10.0, 10.0, {"score": -0.0, "ratio": 1.5}, fid=1)]
+    )
+    b = _as_shapely_features(
+        [point(10.0, 10.0, {"ratio": 1.5, "score": -0.0}, fid=1)]
+    )
+    changed_a, changed_b = tilediff.changed_features(a, b)
+    assert changed_a == [] and changed_b == []
 
 
 def test_correspondence_add_delete_and_move():

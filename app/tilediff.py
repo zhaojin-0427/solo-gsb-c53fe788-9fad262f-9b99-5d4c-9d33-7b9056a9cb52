@@ -34,6 +34,10 @@ Cross-revision correspondence has to match the encoder exactly, because
   cancelled;
 * a pair is "the same feature" only when geometry and typed properties are
   equal (``1`` and ``true`` encode differently and never compare equal);
+  floats are compared by their IEEE-754 double bits the encoder writes
+  verbatim, so a property flipping between ``-0.0`` and ``0.0`` -- equal
+  under Python ``==`` but different MVT bytes -- keeps both copies unmatched
+  instead of silently cancelling the only changed feature;
 * group size differences (added / deleted features) leave the surplus
   features unmatched.
 
@@ -49,6 +53,7 @@ of neighbouring tiles -- never the whole ``2**14`` grid (which would be
 from __future__ import annotations
 
 import math
+import struct
 from itertools import groupby
 from typing import Iterable
 
@@ -132,9 +137,20 @@ def _property_values_equal(a: object, b: object) -> bool:
     must not count as identical.  Every other pair has to share its exact
     type (string / int / float) and value; mismatches are "changed" (which
     only adds candidates, it never removes them).
+
+    Floats are compared by their **IEEE-754 double bits**, not by Python
+    ``==``: the encoder writes each float straight into the protobuf
+    ``double_value`` field, so ``-0.0`` and ``0.0`` -- which Python considers
+    equal -- land as different bytes (sign bit) and must not cancel the
+    feature.  Distinct NaN payloads likewise get distinct encodings.  Every
+    float whose bits are equal compiles identically everywhere, so bit
+    equality is simultaneously the most discriminating *and* a safe basis for
+    cancellation.
     """
     if isinstance(a, bool) or isinstance(b, bool):
         return isinstance(a, bool) and isinstance(b, bool) and a == b
+    if isinstance(a, float) and isinstance(b, float):
+        return struct.pack(">d", a) == struct.pack(">d", b)
     if type(a) is not type(b):
         return False
     return bool(a == b)
